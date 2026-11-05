@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 APP_TITLE = "PS4PkgRenamer"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -178,6 +178,22 @@ def same_path(a: str, b: str) -> bool:
     return nfc(os.path.normcase(os.path.abspath(a))) == nfc(
         os.path.normcase(os.path.abspath(b))
     )
+
+
+def is_same_file(a: str, b: str) -> bool:
+    """True when a and b are the same entry on disk (e.g. names differing only
+    by case on a case-insensitive filesystem such as APFS or exFAT)."""
+    if same_path(a, b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def undo_log_path() -> str:
+    """Undo log lives in the user's home, never inside the pkg library."""
+    return os.path.join(str(Path.home()), UNDO_LOG_NAME)
 
 
 def path_parent(path: str) -> str:
@@ -750,7 +766,7 @@ def preflight_items(items: List[dict]) -> List[str]:
             new_path = os.path.join(folder, it["new_filename"])
             if same_path(old_path, new_path):
                 continue
-            if os.path.exists(new_path):
+            if os.path.exists(new_path) and not is_same_file(old_path, new_path):
                 source_of_target = next(
                     (other for other in group if same_path(other["path"], new_path)),
                     None,
@@ -809,7 +825,8 @@ def two_phase_rename(ops: List[Tuple[str, str]], log: LogFn) -> List[Tuple[str, 
 
 
 def write_undo_log(root: str, renames: List[dict], kind: str) -> Optional[str]:
-    """Write undo log next to root (or its parent / home). renames: [{old, new, type}]"""
+    """Write the undo log to the user's home folder (never into the library).
+    renames: [{old, new, type}]"""
     if not renames:
         return None
     payload = {
@@ -820,25 +837,13 @@ def write_undo_log(root: str, renames: List[dict], kind: str) -> Optional[str]:
         "root": os.path.abspath(root),
         "renames": renames,
     }
-    candidates = []
-    abs_root = os.path.abspath(root)
-    candidates.append(os.path.join(abs_root, UNDO_LOG_NAME))
-    parent = os.path.dirname(abs_root)
-    if parent and parent != abs_root:
-        candidates.append(os.path.join(parent, UNDO_LOG_NAME))
-    candidates.append(os.path.join(str(Path.home()), UNDO_LOG_NAME))
-
-    for path in candidates:
-        try:
-            parent_dir = os.path.dirname(path)
-            if parent_dir and not os.path.isdir(parent_dir):
-                continue
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            return path
-        except OSError:
-            continue
-    return None
+    path = undo_log_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return path
+    except OSError:
+        return None
 
 
 def load_undo_log(path: str) -> Optional[dict]:
@@ -874,7 +879,7 @@ def apply_undo(log_path: str, log: LogFn) -> dict:
             log(f"  [SKIP] missing: {new_path}")
             failed += 1
             continue
-        if os.path.exists(old_path) and not same_path(old_path, new_path):
+        if os.path.exists(old_path) and not is_same_file(old_path, new_path):
             log(f"  [SKIP] original path occupied: {old_path}")
             failed += 1
             continue
@@ -883,9 +888,11 @@ def apply_undo(log_path: str, log: LogFn) -> dict:
             f"{os.path.basename(old_path.rstrip(os.sep))}"
         )
         try:
-            # Single rename is enough; two-phase not required one-at-a-time
-            os.rename(new_path, old_path)
-            undone += 1
+            # Two-phase so case-only renames also work on case-insensitive FS
+            if two_phase_rename([(new_path, old_path)], log):
+                undone += 1
+            else:
+                failed += 1
         except OSError as e:
             log(f"  [ERROR] undo failed: {e}")
             failed += 1
@@ -1034,9 +1041,11 @@ def rename_games(
         summary["_items"] = all_items  # for export
         return summary
 
-    # Apply renames (two-phase per folder)
+    # Apply renames: all file renames first (two-phase per folder), then
+    # folder renames deepest-first so nested game folders keep valid paths.
     undo_records = []
-    for folder, group in _group_by_folder(all_items).items():
+    groups = _group_by_folder(all_items)
+    for folder, group in groups.items():
         ops = []
         for it in group:
             old_path = it["path"]
@@ -1044,9 +1053,6 @@ def rename_games(
             if same_path(old_path, new_path):
                 continue
             ops.append((old_path, new_path))
-
-        # File renames first (folder rename still runs even if every file
-        # is already correctly named).
         if ops:
             done = two_phase_rename(ops, log)
             summary["renamed"] += len(done)
@@ -1057,39 +1063,44 @@ def rename_games(
                     if same_path(it["path"], old):
                         it["path"] = new
 
-        if folders and group:
+    if folders:
+        depth = lambda f: f.rstrip(os.sep).count(os.sep)
+        for folder in sorted(groups, key=depth, reverse=True):
+            group = groups[folder]
             base_title = finalize_filename(group[0]["base_title"])
-            parent = os.path.dirname(folder.rstrip(os.sep))
-            new_folder = os.path.join(parent, base_title)
             folder_path = folder.rstrip(os.sep)
-            if not same_path(new_folder, folder_path):
-                if os.path.exists(new_folder):
-                    log(f"  [SKIP] folder target exists: {new_folder}")
-                else:
-                    try:
-                        os.rename(folder_path, new_folder)
-                        log(f"  Folder renamed -> {new_folder}")
-                        summary["folders_renamed"] += 1
-                        # Only rewrite undo paths that lived under THIS folder.
-                        # (Rewriting every record corrupts multi-game undo logs.)
-                        for rec in undo_records:
-                            if rec.get("type") != "file":
-                                continue
-                            for key in ("old", "new"):
-                                p = rec.get(key, "")
-                                if p and same_path(path_parent(p), folder_path):
-                                    rec[key] = os.path.join(
-                                        new_folder, os.path.basename(p)
-                                    )
-                        undo_records.append(
-                            {
-                                "old": folder_path,
-                                "new": new_folder,
-                                "type": "folder",
-                            }
-                        )
-                    except OSError as e:
-                        log(f"  [ERROR] folder rename failed: {e}")
+            new_folder = os.path.join(os.path.dirname(folder_path), base_title)
+            if same_path(new_folder, folder_path):
+                continue
+            if os.path.exists(new_folder) and not is_same_file(
+                folder_path, new_folder
+            ):
+                log(f"  [SKIP] folder target exists: {new_folder}")
+                continue
+            two_phase_rename([(folder_path, new_folder)], log)
+            moved = os.path.isdir(new_folder) and (
+                not os.path.exists(folder_path)
+                or is_same_file(folder_path, new_folder)
+            )
+            if not moved:
+                log(f"  [ERROR] folder rename failed: {folder_path}")
+                continue
+            log(f"  Folder renamed -> {new_folder}")
+            summary["folders_renamed"] += 1
+            # File undo records point at their final location (files are
+            # undone first). Folder records keep the paths valid at the time
+            # they were renamed (folders are undone in reverse order).
+            prefix = folder_path + os.sep
+            for rec in undo_records:
+                if rec.get("type") != "file":
+                    continue
+                for key in ("old", "new"):
+                    pth = rec.get(key, "")
+                    if pth.startswith(prefix):
+                        rec[key] = os.path.join(new_folder, pth[len(prefix):])
+            undo_records.append(
+                {"old": folder_path, "new": new_folder, "type": "folder"}
+            )
 
     undo_root = next((r for r in root_list if os.path.isdir(r)), None)
     if undo_root is None and root_list:
@@ -1200,7 +1211,7 @@ def push_to_end(
     # Preflight: target exists
     conflicts = []
     for old, new in ops:
-        if os.path.exists(new) and not same_path(old, new):
+        if os.path.exists(new) and not is_same_file(old, new):
             conflicts.append(f"Target exists: {new}")
     if conflicts:
         summary["conflicts"] = len(conflicts)
@@ -1631,29 +1642,8 @@ class PS4PkgRenamerApp(tk.Tk):
             messagebox.showerror(APP_TITLE, str(e))
 
     def _undo_search_paths(self, prefer_themes: bool = False) -> List[str]:
-        games_paths: List[str] = []
-        for d in self.games_listbox.get(0, tk.END):
-            if not d:
-                continue
-            games_paths.append(os.path.join(d, UNDO_LOG_NAME))
-            parent = os.path.dirname(os.path.abspath(d))
-            if parent:
-                games_paths.append(os.path.join(parent, UNDO_LOG_NAME))
-        themes_paths: List[str] = []
-        themes_dir = self.themes_path_var.get().strip()
-        if themes_dir:
-            themes_paths.append(os.path.join(themes_dir, UNDO_LOG_NAME))
-        ordered = (themes_paths + games_paths) if prefer_themes else (games_paths + themes_paths)
-        home = os.path.join(str(Path.home()), UNDO_LOG_NAME)
-        if home not in ordered:
-            ordered.append(home)
-        seen = set()
-        out = []
-        for p in ordered:
-            if p not in seen and os.path.isfile(p):
-                seen.add(p)
-                out.append(p)
-        return out
+        path = undo_log_path()
+        return [path] if os.path.isfile(path) else []
 
     def _undo_last(self, log_widget=None):
         if self._busy:

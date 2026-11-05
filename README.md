@@ -2,8 +2,6 @@
 
 Renames PS4 `.pkg` files using the real title, Title ID, category and minimum firmware read from each package's embedded `param.sfo`, so a flat package installer (e.g. GoldHEN) lists everything alphabetically in the right order — Base, then Update, then DLC — instead of cryptic scene-release filenames. Ships as a desktop app for Windows, macOS, and Linux — no Python or dependencies required.
 
-This PR also keeps the upstream **Install Order** / size-rank / pin-first workflow and layers the v1.1.1 safety and SFO work on top.
-
 ```
 1 CUSA34384_FXDv1.00_[FW900]-[DLPSGAME.COM].pkg
   ->  God of War Ragnarök [CUSA34384] - 0 Base (FW 9.00+).pkg
@@ -58,7 +56,7 @@ For folders of games, homebrew apps, or PS1/PS2/PSP-on-PS4 conversions (each gam
 7. Click **Preview** to see what would change without touching any files.
 8. Click **Apply** to actually rename. A confirmation dialog appears first. Renames are preflight-checked and applied in two phases; an undo log is written on success.
 9. **Export preview...** saves the log as `.txt` or `.csv`.
-10. **Undo last...** reverses the last apply (reads `.ps4pkgrenamer_last_undo.json`).
+10. **Undo last...** reverses the last apply (reads `.ps4pkgrenamer_last_undo.json` from your home folder — nothing is written into your pkg library).
 
 Re-running after adding a new game recomputes size ranking from scratch across everything, since a new heavy game can shift every rank number after it.
 
